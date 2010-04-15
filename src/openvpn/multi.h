@@ -71,6 +71,9 @@ struct client_connect_state
   /* Remember which option classes where processed for delayed option
      handling. */
   unsigned int option_types_found;
+
+  char *deferred_ret_file;
+  char *config_file;
 };
 
 /**
