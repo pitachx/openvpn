@@ -118,7 +118,6 @@ struct multi_instance {
 #endif
 };
 
-
 /**
  * Main OpenVPN server state structure.
  *
@@ -190,6 +189,16 @@ struct multi_context {
 #endif
 
     struct deferred_signal_schedule_entry deferred_shutdown_signal;
+};
+
+/**
+ * Return values used by the client connect call-back functions.
+ */
+enum client_connect_return
+{
+  CC_RET_FAILED,
+  CC_RET_SUCCEEDED,
+  CC_RET_SKIPPED
 };
 
 /*
