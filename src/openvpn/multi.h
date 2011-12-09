@@ -55,6 +55,22 @@ struct multi_reap
     time_t last_call;
 };
 
+/**
+ * Detached client connection state.  This is the state that is tracked while
+ * the client connect hooks are executed.
+ */
+struct client_connect_state
+{
+  /* Index of currently executed handler.  */
+  int cur_handler_idx;
+  /* Did all of the handlers succeed up to now?  */
+  bool succeeded;
+  /* How many handlers succeeded?  */
+  int succeeded_count;
+  /* Remember which option classes where processed for delayed option
+     handling. */
+  unsigned int option_types_found;
+};
 
 struct deferred_signal_schedule_entry
 {
@@ -115,6 +131,7 @@ struct multi_instance {
 #ifdef ENABLE_ASYNC_PUSH
     int inotify_watch; /* watch descriptor for acf */
 #endif
+    struct client_connect_state *client_connect_state;
 };
 
 /**
@@ -197,6 +214,7 @@ enum client_connect_return
 {
   CC_RET_FAILED,
   CC_RET_SUCCEEDED,
+  CC_RET_DEFERRED,
   CC_RET_SKIPPED
 };
 
