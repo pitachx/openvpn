@@ -56,6 +56,22 @@ struct multi_reap
   time_t last_call;
 };
 
+/**
+ * Detached client connection state.  This is the state that is tracked while
+ * the client connect hooks are executed.
+ */
+struct client_connect_state
+{
+  /* Index of currently executed handler.  */
+  int cur_handler_idx;
+  /* Did all of the handlers succeed up to now?  */
+  bool succeeded;
+  /* How many handlers succeeded?  */
+  int succeeded_count;
+  /* Remember which option classes where processed for delayed option
+     handling. */
+  unsigned int option_types_found;
+};
 
 /**
  * Server-mode state structure for one single VPN tunnel.
@@ -105,6 +121,7 @@ struct multi_instance {
 
   struct context context;       /**< The context structure storing state
                                  *   for this VPN tunnel. */
+  struct client_connect_state *client_connect_state;
 };
 
 /**
@@ -180,6 +197,7 @@ enum client_connect_return
 {
   CC_RET_FAILED,
   CC_RET_SUCCEEDED,
+  CC_RET_DEFERRED,
   CC_RET_SKIPPED
 };
 
