@@ -2063,7 +2063,7 @@ multi_client_connect_late_setup (struct multi_context *m,
 				 struct multi_instance *mi,
 				 const unsigned int option_types_found,
 				 int cc_succeeded,
-				 const int cc_succeeded_count)
+				 int cc_succeeded_count)
 {
   struct gc_arena gc = gc_new ();
   ASSERT (mi->context.c1.tuntap);
