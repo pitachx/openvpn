@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2010 OpenVPN Technologies, Inc. <sales@openvpn.net>
+ *  Copyright (C) 2002-2017 OpenVPN Technologies, Inc. <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -25,6 +25,11 @@
 #include "config.h"
 #elif defined(_MSC_VER)
 #include "config-msvc.h"
+#endif
+
+#ifdef HAVE_SYS_INOTIFY_H
+#include <sys/inotify.h>
+#define INOTIFY_EVENT_BUFFER_SIZE 16384
 #endif
 
 #include "syshead.h"
@@ -106,9 +111,8 @@ learn_address_script (const struct multi_context *m,
   if (plugin_defined (plugins, OPENVPN_PLUGIN_LEARN_ADDRESS))
     {
       struct argv argv = argv_new ();
-      argv_printf (&argv, "%s %s",
-		   op,
-		   mroute_addr_print (addr, &gc));
+      argv_parse_cmd(&argv, m->top.options.learn_address_script);
+      argv_printf_cat(&argv, "%s %s", op, mroute_addr_print(addr, &gc));
       if (mi)
 	argv_printf_cat (&argv, "%s", tls_common_name (mi->context.c2.tls_multi, false));
       if (plugin_call (plugins, OPENVPN_PLUGIN_LEARN_ADDRESS, &argv, NULL, es) != OPENVPN_PLUGIN_FUNC_SUCCESS)
@@ -245,6 +249,23 @@ cid_compare_function (const void *key1, const void *key2)
 
 #endif
 
+#ifdef ENABLE_ASYNC_PUSH
+static uint32_t
+/*
+ * inotify watcher descriptors are used as hash value
+ */
+int_hash_function(const void *key, uint32_t iv)
+{
+    return (unsigned long)key;
+}
+
+static bool
+int_compare_function(const void *key1, const void *key2)
+{
+    return (unsigned long)key1 == (unsigned long)key2;
+}
+#endif
+
 /*
  * Main initialization function, init multi_context object.
  */
@@ -304,6 +325,17 @@ multi_init (struct multi_context *m, struct context *t, bool tcp_mode, int threa
 			   0,
 			   cid_hash_function,
 			   cid_compare_function);
+#endif
+
+#ifdef ENABLE_ASYNC_PUSH
+    /*
+     * Mapping between inotify watch descriptors and
+     * multi_instances.
+     */
+  m->inotify_watchers = hash_init(t->options.real_hash_size,
+                                  get_random(),
+                                  int_hash_function,
+                                  int_compare_function);
 #endif
 
   /*
@@ -398,6 +430,7 @@ multi_init (struct multi_context *m, struct context *t, bool tcp_mode, int threa
         t->options.stale_routes_check_interval, t->options.stale_routes_ageing_time);
       event_timeout_init (&m->stale_routes_check_et, t->options.stale_routes_check_interval, 0);
     }
+  m->deferred_shutdown_signal.signal_received = 0;
 }
 
 const char *
@@ -516,7 +549,7 @@ multi_client_disconnect_script (struct multi_context *m,
 	{
 	  struct argv argv = argv_new ();
 	  setenv_str (mi->context.c2.es, "script_type", "client-disconnect");
-	  argv_printf (&argv, "%sc", mi->context.options.client_disconnect_script);
+	  argv_parse_cmd(&argv, mi->context.options.client_disconnect_script);
 	  openvpn_run_script (&argv, mi->context.c2.es, 0, "--client-disconnect");
 	  argv_reset (&argv);
 	}
@@ -568,7 +601,16 @@ multi_close_instance (struct multi_context *m,
 	}
 #endif
 
+#ifdef ENABLE_ASYNC_PUSH
+    if (mi->inotify_watch != -1)
+    {
+        hash_remove(m->inotify_watchers, (void *) (unsigned long)mi->inotify_watch);
+        mi->inotify_watch = -1;
+    }
+#endif
+    if (mi->context.c2.tls_multi->peer_id != MAX_PEER_ID) {
       m->instances[mi->context.c2.tls_multi->peer_id] = NULL;
+    }
 
       schedule_remove_entry (m->schedule, (struct schedule_entry *) mi);
 
@@ -650,6 +692,11 @@ multi_uninit (struct multi_context *m)
 
 	  free(m->instances);
 
+#ifdef ENABLE_ASYNC_PUSH
+      hash_free(m->inotify_watchers);
+      m->inotify_watchers = NULL;
+#endif
+
 	  schedule_free (m->schedule);
 	  mbuf_free (m->mbuf);
 	  ifconfig_pool_free (m->ifconfig_pool);
@@ -726,6 +773,11 @@ multi_create_instance (struct multi_context *m, const struct mroute_addr *real)
 #endif
 
   mi->context.c2.push_reply_deferred = true;
+
+#ifdef ENABLE_ASYNC_PUSH
+  mi->context.c2.push_request_received = false;
+  mi->inotify_watch = -1;
+#endif
 
   if (!multi_process_post (m, mi, MPP_PRE_SELECT))
     {
@@ -927,11 +979,18 @@ multi_print_status (struct multi_context *m, struct status_output *so, const int
 	    }
 	hash_iterator_free (&hi);
       }
-#endif
+#endif /* ifdef PACKET_TRUNCATION_CHECK */
 
       status_flush (so);
       gc_free (&gc_top);
     }
+
+#ifdef ENABLE_ASYNC_PUSH
+    if (m->inotify_watchers)
+    {
+        msg(D_MULTI_DEBUG, "inotify watchers count: %d\n", hash_n_elements(m->inotify_watchers));
+    }
+#endif
 }
 
 /*
@@ -1149,7 +1208,7 @@ multi_learn_in6_addr  (struct multi_context *m,
   addr.len = 16;
   addr.type = MR_ADDR_IPV6;
   addr.netbits = 0;
-  memcpy( &addr.addr, &a6, sizeof(a6) );
+  addr.v6.addr = a6;
 
   if (netbits >= 0)
     {
@@ -1320,17 +1379,14 @@ multi_select_virtual_addr (struct multi_context *m, struct multi_instance *mi)
       mi->context.c2.push_ifconfig_defined = true;
       mi->context.c2.push_ifconfig_local = mi->context.options.push_ifconfig_local;
       mi->context.c2.push_ifconfig_remote_netmask = mi->context.options.push_ifconfig_remote_netmask;
-#ifdef ENABLE_CLIENT_NAT
       mi->context.c2.push_ifconfig_local_alias = mi->context.options.push_ifconfig_local_alias;
-#endif
 
       /* the current implementation does not allow "static IPv4, pool IPv6",
        * (see below) so issue a warning if that happens - don't break the
        * session, though, as we don't even know if this client WANTS IPv6
        */
-      if ( mi->context.c1.tuntap->ipv6 &&
-	   mi->context.options.ifconfig_ipv6_pool_defined &&
-	   ! mi->context.options.push_ifconfig_ipv6_defined )
+    if (mi->context.options.ifconfig_ipv6_pool_defined
+        && !mi->context.options.push_ifconfig_ipv6_defined)
 	{
 	  msg( M_INFO, "MULTI_sva: WARNING: if --ifconfig-push is used for IPv4, automatic IPv6 assignment from --ifconfig-ipv6-pool does not work.  Use --ifconfig-ipv6-push for IPv6 then." );
 	}
@@ -1385,7 +1441,7 @@ multi_select_virtual_addr (struct multi_context *m, struct multi_instance *mi)
 	      mi->context.c2.push_ifconfig_ipv6_remote = 
 		    mi->context.c1.tuntap->local_ipv6;
 	      mi->context.c2.push_ifconfig_ipv6_netbits = 
-		    mi->context.options.ifconfig_ipv6_pool_netbits;
+		    mi->context.options.ifconfig_ipv6_netbits;
 	      mi->context.c2.push_ifconfig_ipv6_defined = true;
 	    }
 	}
@@ -1402,8 +1458,7 @@ multi_select_virtual_addr (struct multi_context *m, struct multi_instance *mi)
    * way round ("dynamic IPv4, static IPv6") or "both static" makes sense
    * -> and so it's implemented right now
    */
-  if ( mi->context.c1.tuntap->ipv6 &&
-       mi->context.options.push_ifconfig_ipv6_defined )
+  if (mi->context.options.push_ifconfig_ipv6_defined)
     {
       mi->context.c2.push_ifconfig_ipv6_local = 
 	    mi->context.options.push_ifconfig_ipv6_local;
@@ -1461,6 +1516,24 @@ multi_set_virtual_addr_env (struct multi_context *m, struct multi_instance *mi)
      *       used for, but if we have them for IPv4, we should also have
      *       them for IPv6, no?
      */
+    setenv_del(mi->context.c2.es, "ifconfig_pool_local_ip6");
+    setenv_del(mi->context.c2.es, "ifconfig_pool_remote_ip6");
+    setenv_del(mi->context.c2.es, "ifconfig_pool_ip6_netbits");
+
+    if (mi->context.c2.push_ifconfig_ipv6_defined)
+    {
+        setenv_in6_addr(mi->context.c2.es,
+                        "ifconfig_pool_remote",
+                        &mi->context.c2.push_ifconfig_ipv6_local,
+                        SA_SET_IF_NONZERO);
+        setenv_in6_addr(mi->context.c2.es,
+                        "ifconfig_pool_local",
+                        &mi->context.c2.push_ifconfig_ipv6_remote,
+                        SA_SET_IF_NONZERO);
+        setenv_int(mi->context.c2.es,
+                   "ifconfig_pool_ip6_netbits",
+                   mi->context.c2.push_ifconfig_ipv6_netbits);
+    }
 }
 
 /*
@@ -1934,9 +2007,8 @@ multi_client_connect_call_script (struct multi_context *m,
 	  goto cleanup;
 	}
 
-      argv_printf (&argv, "%sc %s",
-		   mi->context.options.client_connect_script,
-		   ccs->config_file);
+      argv_parse_cmd(&argv, mi->context.options.client_connect_script);
+      argv_printf_cat(&argv, "%s", ccs->config_file);
 
       if (openvpn_run_script (&argv, mi->context.c2.es, 0, "--client-connect"))
 	{
@@ -2008,6 +2080,7 @@ multi_client_connect_late_setup (struct multi_context *m,
     {
       msg (D_MULTI_ERRORS, "MULTI: client has been rejected due to 'disable' directive");
       cc_succeeded = false;
+      cc_succeeded_count = 0;
     }
 
   if (cc_succeeded)
@@ -2085,6 +2158,14 @@ multi_client_connect_late_setup (struct multi_context *m,
 
       /* set context-level authentication flag */
       mi->context.c2.context_auth = CAS_SUCCEEDED;
+
+#ifdef ENABLE_ASYNC_PUSH
+      /* authentication complete, send push reply */
+      if (mi->context.c2.push_request_received)
+      {
+          process_incoming_push_request(&mi->context);
+      }
+#endif
     }
   else
     {
@@ -2270,6 +2351,58 @@ multi_connection_established (struct multi_context *m, struct multi_instance *mi
    */
   mi->context.c2.push_reply_deferred = false;
 }
+
+#ifdef ENABLE_ASYNC_PUSH
+/*
+ * Called when inotify event is fired, which happens when acf file is closed or deleted.
+ * Continues authentication and sends push_reply.
+ */
+void
+multi_process_file_closed(struct multi_context *m, const unsigned int mpp_flags)
+{
+    char buffer[INOTIFY_EVENT_BUFFER_SIZE];
+    size_t buffer_i = 0;
+    int r = read(m->top.c2.inotify_fd, buffer, INOTIFY_EVENT_BUFFER_SIZE);
+
+    while (buffer_i < r)
+    {
+        /* parse inotify events */
+        struct inotify_event *pevent = (struct inotify_event *) &buffer[buffer_i];
+        size_t event_size = sizeof(struct inotify_event) + pevent->len;
+        buffer_i += event_size;
+
+        msg(D_MULTI_DEBUG, "MULTI: modified fd %d, mask %d", pevent->wd, pevent->mask);
+
+        struct multi_instance *mi = hash_lookup(m->inotify_watchers, (void *) (unsigned long) pevent->wd);
+
+        if (pevent->mask & IN_CLOSE_WRITE)
+        {
+            if (mi)
+            {
+                /* continue authentication and send push_reply */
+                multi_process_post(m, mi, mpp_flags);
+            }
+            else
+            {
+                msg(D_MULTI_ERRORS, "MULTI: multi_instance not found!");
+            }
+        }
+        else if (pevent->mask & IN_IGNORED)
+        {
+            /* this event is _always_ fired when watch is removed or file is deleted */
+            if (mi)
+            {
+                hash_remove(m->inotify_watchers, (void *) (unsigned long) pevent->wd);
+                mi->inotify_watch = -1;
+            }
+        }
+        else
+        {
+            msg(D_MULTI_ERRORS, "MULTI: unknown mask %d", pevent->mask);
+        }
+    }
+}
+#endif /* ifdef ENABLE_ASYNC_PUSH */
 
 /*
  * Add a mbuf buffer to a particular
@@ -2530,11 +2663,13 @@ void multi_process_float (struct multi_context* m, struct multi_instance* mi)
     {
       struct multi_instance *ex_mi = (struct multi_instance *) he->value;
 
-      const char *cn = tls_common_name (mi->context.c2.tls_multi, true);
-      const char *ex_cn = tls_common_name (ex_mi->context.c2.tls_multi, true);
-      if (cn && ex_cn && strcmp (cn, ex_cn))
+    struct tls_multi *m1 = mi->context.c2.tls_multi;
+    struct tls_multi *m2 = ex_mi->context.c2.tls_multi;
+
+    /* do not float if target address is taken by client with another cert */
+    if (!cert_hash_compare(m1->locked_cert_hash_set, m2->locked_cert_hash_set))
 	{
-	  msg (D_MULTI_MEDIUM, "prevent float to %s",
+	  msg(D_MULTI_LOW, "Disallow float to an address taken by another client %s",
 		multi_instance_string (ex_mi, false, &gc));
 
 	  mi->context.c2.buf.len = 0;
@@ -2546,9 +2681,13 @@ void multi_process_float (struct multi_context* m, struct multi_instance* mi)
       multi_close_instance(m, ex_mi, false);
     }
 
-    msg (D_MULTI_MEDIUM, "peer %" PRIu32 " floated from %s to %s", mi->context.c2.tls_multi->peer_id,
-        mroute_addr_print (&mi->real, &gc), print_link_socket_actual (&m->top.c2.from, &gc));
+    msg(D_MULTI_MEDIUM, "peer %" PRIu32 " (%s) floated from %s to %s",
+        mi->context.c2.tls_multi->peer_id,
+        tls_common_name(mi->context.c2.tls_multi, false),
+        mroute_addr_print(&mi->real, &gc),
+        print_link_socket_actual(&m->top.c2.from, &gc));
 
+    /* remove old address from hash table before changing address */
     ASSERT (hash_remove(m->hash, &mi->real));
     ASSERT (hash_remove(m->iter, &mi->real));
 
@@ -2569,8 +2708,7 @@ void multi_process_float (struct multi_context* m, struct multi_instance* mi)
     ASSERT (hash_add (m->iter, &mi->real, mi, false));
 
 #ifdef MANAGEMENT_DEF_AUTH
-    hash_remove (m->cid_hash, &mi->context.c2.mda_context.cid);
-    hash_add (m->cid_hash, &mi->context.c2.mda_context.cid, mi, false);
+	ASSERT(hash_add(m->cid_hash, &mi->context.c2.mda_context.cid, mi, true));
 #endif
 
 done:
@@ -2663,8 +2801,8 @@ multi_process_incoming_link (struct multi_context *m, struct multi_instance *ins
 	      else if (multi_get_instance_by_virtual_addr (m, &src, true) != m->pending)
 		{
 		  /* IPv6 link-local address (fe80::xxx)? */
-		  if ( (src.type & MR_ADDR_MASK) == MR_ADDR_IPV6 &&
-		        src.addr[0] == 0xfe && src.addr[1] == 0x80 )
+            if ( (src.type & MR_ADDR_MASK) == MR_ADDR_IPV6
+                 && IN6_IS_ADDR_LINKLOCAL(&src.v6.addr) )
 		    {
 		      /* do nothing, for now.  TODO: add address learning */
 		    }
@@ -2966,10 +3104,19 @@ multi_process_timeout (struct multi_context *m, const unsigned int mpp_flags)
   /* instance marked for wakeup? */
   if (m->earliest_wakeup)
     {
-      set_prefix (m->earliest_wakeup);
-      ret = multi_process_post (m, m->earliest_wakeup, mpp_flags);
-      m->earliest_wakeup = NULL;
-      clear_prefix ();
+        if (m->earliest_wakeup == (struct multi_instance *)&m->deferred_shutdown_signal)
+        {
+            schedule_remove_entry(m->schedule, (struct schedule_entry *) &m->deferred_shutdown_signal);
+            throw_signal(m->deferred_shutdown_signal.signal_received);
+        }
+        else
+        {
+      		set_prefix (m->earliest_wakeup);
+      		ret = multi_process_post (m, m->earliest_wakeup, mpp_flags);
+      		m->earliest_wakeup = NULL;
+      		clear_prefix ();
+		}
+	  m->earliest_wakeup = NULL;
     }
   return ret;
 }
@@ -3083,11 +3230,9 @@ multi_process_per_second_timers_dowork (struct multi_context *m)
 }
 
 void
-multi_top_init (struct multi_context *m, const struct context *top, const bool alloc_buffers)
+multi_top_init (struct multi_context *m, const struct context *top)
 {
   inherit_context_top (&m->top, top);
-  m->top.c2.buffers = NULL;
-  if (alloc_buffers)
     m->top.c2.buffers = init_context_buffers (&top->c2.frame);
 }
 
@@ -3096,6 +3241,48 @@ multi_top_free (struct multi_context *m)
 {
   close_context (&m->top, -1, CC_GC_FREE);
   free_context_buffers (m->top.c2.buffers);
+}
+
+static bool
+is_exit_restart(int sig)
+{
+    return (sig == SIGUSR1 || sig == SIGTERM || sig == SIGHUP || sig == SIGINT);
+}
+
+static void
+multi_push_restart_schedule_exit(struct multi_context *m, bool next_server)
+{
+    struct hash_iterator hi;
+    struct hash_element *he;
+    struct timeval tv;
+
+    /* tell all clients to restart */
+    hash_iterator_init(m->iter, &hi);
+    while ((he = hash_iterator_next(&hi)))
+    {
+        struct multi_instance *mi = (struct multi_instance *) he->value;
+        if (!mi->halt)
+        {
+            send_control_channel_string(&mi->context, next_server ? "RESTART,[N]" : "RESTART", D_PUSH);
+            multi_schedule_context_wakeup(m, mi);
+        }
+    }
+    hash_iterator_free(&hi);
+
+    /* reschedule signal */
+    ASSERT(!openvpn_gettimeofday(&m->deferred_shutdown_signal.wakeup, NULL));
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    tv_add(&m->deferred_shutdown_signal.wakeup, &tv);
+
+    m->deferred_shutdown_signal.signal_received = m->top.sig->signal_received;
+
+    schedule_add_entry(m->schedule,
+                       (struct schedule_entry *) &m->deferred_shutdown_signal,
+                       &m->deferred_shutdown_signal.wakeup,
+                       compute_wakeup_sigma(&m->deferred_shutdown_signal.wakeup));
+
+    m->top.sig->signal_received = 0;
 }
 
 /*
@@ -3112,6 +3299,14 @@ multi_process_signal (struct multi_context *m)
       status_close (so);
       m->top.sig->signal_received = 0;
       return false;
+    }
+    else if (proto_is_dgram(m->top.options.ce.proto)
+             && is_exit_restart(m->top.sig->signal_received)
+             && (m->deferred_shutdown_signal.signal_received == 0)
+             && m->top.options.ce.explicit_exit_notification != 0)
+    {
+        multi_push_restart_schedule_exit(m, m->top.options.ce.explicit_exit_notification == 2);
+        return false;
     }
   return true;
 }
