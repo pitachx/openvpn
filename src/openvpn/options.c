@@ -197,7 +197,7 @@ static const char usage_message[] =
     "                  is established.  Multiple routes can be specified.\n"
     "                  netmask default: 255.255.255.255\n"
     "                  gateway default: taken from --route-gateway or --ifconfig\n"
-    "                  Specify default by leaving blank or setting to \"nil\".\n"
+    "                  Specify default by leaving blank or setting to \"default\".\n"
     "--route-ipv6 network/bits [gateway] [metric] :\n"
     "                  Add IPv6 route to routing table after connection\n"
     "                  is established.  Multiple routes can be specified.\n"
@@ -448,7 +448,7 @@ static const char usage_message[] =
     "                  user/pass via environment, if method='via-file', pass\n"
     "                  user/pass via temporary file.\n"
     "--auth-gen-token  [lifetime] Generate a random authentication token which is pushed\n"
-    "                  to each client, replacing the password.  Usefull when\n"
+    "                  to each client, replacing the password.  Useful when\n"
     "                  OTP based two-factor auth mechanisms are in use and\n"
     "                  --reneg-* options are enabled. Optionally a lifetime in seconds\n"
     "                  for generated tokens can be set.\n"
@@ -6805,6 +6805,20 @@ add_option(struct options *options,
         options->port_share_host = p[1];
         options->port_share_port = p[2];
         options->port_share_journal_dir = p[3];
+    }
+  else if (streq (p[0], "pkcs11-id-type") ||
+           streq (p[0], "pkcs11-sign-mode") ||
+           streq (p[0], "pkcs11-slot") ||
+           streq (p[0], "pkcs11-slot-type") ||
+           streq (p[0], "show-pkcs11-objects") ||
+           streq (p[0], "show-pkcs11-slots"))
+    {
+      if (file)
+	msg (msglevel, "You are using an obsolete parameter in %s:%d: %s (%s).\nPlease see /usr/share/doc/openvpn/NEWS.Debian.gz for details.",
+             file, line, p[0], PACKAGE_VERSION);
+      else
+	msg (msglevel, "You are using an obsolete parameter: --%s (%s).\nPlease see /usr/share/doc/openvpn/NEWS.Debian.gz for details.",
+             p[0], PACKAGE_VERSION);
     }
 #endif
     else if (streq(p[0], "client-to-client") && !p[1])
